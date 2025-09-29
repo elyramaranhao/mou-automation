@@ -13,21 +13,31 @@ from docx import Document
 from docx.shared import Pt
 from pydantic import BaseModel, Field, validator
 
-st.set_page_config(page_title="Gerador de MOU – (sem Google)", page_icon="📝", layout="wide")
+# -------------------------------------------------
+# Config
+# -------------------------------------------------
+st.set_page_config(
+    page_title="Gerador de MOU – (sem Google)",
+    page_icon="📝",
+    layout="wide"
+)
 
 PLACEHOLDER_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}", re.IGNORECASE)
 
-# ---------------------------
+# -------------------------------------------------
 # Utilitários .docx
-# ---------------------------
+# -------------------------------------------------
 def _iter_all_paragraphs(doc: Document):
+    # Parágrafos do corpo
     for p in doc.paragraphs:
         yield p
+    # Parágrafos em tabelas
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     yield p
+    # Cabeçalho/Rodapé
     for section in doc.sections:
         if section.header:
             for p in section.header.paragraphs:
@@ -38,60 +48,68 @@ def _iter_all_paragraphs(doc: Document):
 
 def _para_text(p) -> str:
     txt = "".join(run.text for run in p.runs) or p.text or ""
-    # normaliza espaços para facilitar o match
     return re.sub(r"\s+", " ", txt).strip()
 
 def extract_placeholders(doc: Document) -> Set[str]:
     found: Set[str] = set()
     for p in _iter_all_paragraphs(doc):
-        text = _para_text(p)
-        for m in PLACEHOLDER_RE.finditer(text):
+        for m in PLACEHOLDER_RE.finditer(_para_text(p)):
             found.add(m.group(1).strip().upper())
     return found
 
 def _is_exception_phrase(text_low: str) -> bool:
-    """Parágrafos que DEVEM ficar sem negrito (PT/EN)."""
-    # 1) Frase longa de requisitos
-    if text_low.startswith("como parte integrante deste documento") and "continuidade do processo" in text_low:
+    """
+    Parágrafos que DEVEM ficar sem negrito (PT/EN).
+    Busca por palavras-chave em qualquer posição do parágrafo.
+    """
+    # 1) Frase longa de requisitos (PT/EN)
+    if "como parte integrante deste documento" in text_low and "continuidade do processo" in text_low:
         return True
-    if text_low.startswith("as an integral part of this document") and "continuity of the nomination process" in text_low:
+    if "as an integral part of this document" in text_low and "continuity of the nomination process" in text_low:
         return True
-    # 2) Linha do Business Plan
-    if text_low.startswith("business plan apresentado e validado em"):
+
+    # 2) Linha do Business Plan (PT/EN)
+    if "business plan apresentado" in text_low and ("validado" in text_low or "apresentado" in text_low):
         return True
-    if text_low.startswith("business plan presented") and ("validated" in text_low or "approved" in text_low) and ("on" in text_low or ":" in text_low):
+    if "business plan" in text_low and ("validated" in text_low or "approved" in text_low):
         return True
-    # 3) Título da seção 2
-    if text_low.startswith("2.") and "especifica" in text_low and ("acordadas" in text_low or "alterações" in text_low or "alteracoes" in text_low):
+
+    # 3) Título da seção 2 (PT/EN) – tolerante a quebras
+    pt_match = ("especifica" in text_low) and ("acordadas" in text_low or "alterações" in text_low or "alteracoes" in text_low)
+    en_match = ("specification" in text_low or "specifications" in text_low) and ("agreed" in text_low or "approved" in text_low) and ("amendment" in text_low or "changes" in text_low or "modifications" in text_low)
+    if pt_match or en_match:
         return True
-    if text_low.startswith("2.") and "specification" in text_low and ("agreed" in text_low or "approved" in text_low) and ("change" in text_low or "modification" in text_low):
+
+    # 4) Linha que é apenas "N/A"
+    if re.fullmatch(r"\s*n\s*/?\s*a\s*\.?\s*", text_low):
         return True
+
     return False
 
 def replace_placeholders_and_collect_exceptions(doc: Document, mapping: Dict[str, str]):
     """
     1) Marca como exceção (sem negrito) os parágrafos que CONTÊM {{BP_DATE}} e {{COMMENTS}}.
-    2) Faz replace dos placeholders (case-insensitive) no documento inteiro.
+    2) Faz replace dos placeholders no documento inteiro (case-insensitive).
     Retorna set com referências de parágrafos que devem ficar sem negrito.
     """
     normalized = {f"{{{{{k}}}}}": str(v) for k, v in mapping.items()}
-    exceptions = set()  # parágrafos que NÃO devem ficar em negrito
+    exceptions = set()
 
     for p in _iter_all_paragraphs(doc):
         orig = _para_text(p)
         low = orig.lower()
-        # marca exceções por placeholder
+
+        # exceções por placeholder
         if "{{bp_date}}" in low or "{{comments}}" in low:
             exceptions.add(p)
 
         # replace case-insensitive
         replaced = orig
         for k, v in normalized.items():
-            pattern = re.compile(re.escape(k), re.IGNORECASE)
-            replaced = pattern.sub(v, replaced)
+            replaced = re.compile(re.escape(k), re.IGNORECASE).sub(v, replaced)
 
         if replaced != orig:
-            # limpar runs e escrever como único run
+            # reescreve parágrafo como único run
             for _ in range(len(p.runs)):
                 p.runs[0].clear()
                 p.runs[0].text = ""
@@ -102,40 +120,56 @@ def replace_placeholders_and_collect_exceptions(doc: Document, mapping: Dict[str
 
 def enforce_calibri11_and_bold_with_exceptions(doc: Document, exceptions: Set):
     """
-    Aplica Calibri 11 e negrito em tudo, depois remove negrito
-    1) nos parágrafos coletados em 'exceptions' e
-    2) nos que casam com as frases de exceção (PT/EN).
+    Aplica Calibri 11 e negrito em tudo; remove negrito:
+      - nos parágrafos coletados em 'exceptions' ({{BP_DATE}} e {{COMMENTS}}),
+      - nos que casam com frases/padrões de exceção (inclui N/A),
+      - e também no "2." quando o título vem quebrado em parágrafos.
     """
-    # 1) Calibri 11 + bold=True em todo mundo
-    for p in _iter_all_paragraphs(doc):
+    all_paras = list(_iter_all_paragraphs(doc))
+
+    # 1) Calibri 11 + bold=True em todos
+    for p in all_paras:
         for run in p.runs:
             run.font.name = "Calibri"
             run.font.size = Pt(11)
             run.bold = True
 
-    # 2) Desmarca bold nos parágrafos de exceção
-    for p in _iter_all_paragraphs(doc):
-        text_low = _para_text(p).lower()
-        if (p in exceptions) or _is_exception_phrase(text_low):
-            for run in p.runs:
-                run.bold = False
+    def unbold(p):
+        for run in p.runs:
+            run.bold = False
 
-# ---------------------------
-# PDF
-# ---------------------------
+    # 2) Desmarca bold conforme exceções e vizinhos de "2."
+    for i, p in enumerate(all_paras):
+        text_low = _para_text(p).lower()
+
+        if (p in exceptions) or _is_exception_phrase(text_low):
+            unbold(p)
+            continue
+
+        # Se o parágrafo for apenas "2." / "2", desnegrita e checa o seguinte
+        if text_low in {"2.", "2"}:
+            unbold(p)
+            if i + 1 < len(all_paras):
+                next_low = _para_text(all_paras[i + 1]).lower()
+                if _is_exception_phrase(next_low):
+                    unbold(all_paras[i + 1])
+
+# -------------------------------------------------
+# PDF (best effort)
+# -------------------------------------------------
 def try_export_pdf(doc_bytes: bytes) -> bytes:
     """
-    Tenta converter DOCX->PDF com docx2pdf (Word), se falhar tenta LibreOffice.
-    Retorna bytes do PDF ou levanta Exception.
+    Tenta DOCX->PDF com docx2pdf (Word/macOS/Windows).
+    Se falhar, tenta LibreOffice (soffice).
+    Retorna bytes do PDF ou levanta RuntimeError.
     """
-    # caminho temporário
     with tempfile.TemporaryDirectory() as td:
         docx_path = os.path.join(td, "out.docx")
         pdf_path = os.path.join(td, "out.pdf")
         with open(docx_path, "wb") as f:
             f.write(doc_bytes)
 
-        # 1) Tenta docx2pdf (somente macOS/Windows com Word)
+        # 1) docx2pdf
         try:
             from docx2pdf import convert
             convert(docx_path, pdf_path)
@@ -144,7 +178,7 @@ def try_export_pdf(doc_bytes: bytes) -> bytes:
         except Exception:
             pass
 
-        # 2) Tenta LibreOffice (precisa 'soffice' no PATH)
+        # 2) LibreOffice
         try:
             subprocess.run(
                 ["soffice", "--headless", "--convert-to", "pdf", "--outdir", td, docx_path],
@@ -155,9 +189,9 @@ def try_export_pdf(doc_bytes: bytes) -> bytes:
         except Exception as e:
             raise RuntimeError("Não foi possível gerar PDF (docx2pdf/LibreOffice indisponíveis).") from e
 
-# ---------------------------
-# Modelo / validação
-# ---------------------------
+# -------------------------------------------------
+# Modelo de dados
+# -------------------------------------------------
 class JobConfig(BaseModel):
     title: str
     placeholders: Dict[str, str] = Field(default_factory=dict)
@@ -170,11 +204,11 @@ class JobConfig(BaseModel):
             fixed[kk] = str(val)
         return fixed
 
-# ---------------------------
+# -------------------------------------------------
 # UI
-# ---------------------------
+# -------------------------------------------------
 st.title("Gerador de MOU – usando modelo .docx (sem Google)")
-st.caption("Upload do template .docx, preenchimento e download do .docx/.pdf — Calibri 11 em tudo; negrito em tudo exceto as linhas especificadas (PT/EN).")
+st.caption("Upload do template .docx, preenchimento e download do .docx/.pdf — Calibri 11 aplicado; negrito em tudo exceto linhas especificadas (PT/EN).")
 
 with st.sidebar:
     st.header("⚙️ Configuração")
@@ -195,9 +229,9 @@ if not placeholders_found:
     st.warning("Nenhum placeholder no formato {{CHAVE}} foi encontrado no modelo. Ex.: {{GROUP_NAME}}")
     st.stop()
 
-# ---------------------------
+# -------------------------------------------------
 # Modo individual
-# ---------------------------
+# -------------------------------------------------
 if not batch_mode:
     st.subheader("Gerar 1 documento")
 
@@ -216,7 +250,7 @@ if not batch_mode:
     if submitted:
         cfg = JobConfig(title=title.strip() or default_title, placeholders=mapping)
 
-        # cria doc, substitui e aplica formatação/exceções
+        # monta doc, substitui e aplica formatação/exceções
         doc = Document(io.BytesIO(template_bytes))
         exceptions = replace_placeholders_and_collect_exceptions(doc, cfg.placeholders)
         enforce_calibri11_and_bold_with_exceptions(doc, exceptions)
@@ -244,12 +278,12 @@ if not batch_mode:
                     file_name=f"{cfg.title}.pdf",
                     mime="application/pdf",
                 )
-            except Exception as e:
+            except Exception:
                 st.info("PDF opcional: instale **Microsoft Word (docx2pdf)** ou **LibreOffice** para habilitar a conversão.")
 
-# ---------------------------
+# -------------------------------------------------
 # Modo CSV (lote)
-# ---------------------------
+# -------------------------------------------------
 else:
     st.subheader("Gerar vários documentos (CSV)")
     st.markdown("O CSV deve ter colunas com os **mesmos nomes** dos placeholders (sem `{{}}`). Ex.: `GROUP_NAME,CNPJ,...`. Opcional: `TITLE`.")
@@ -282,22 +316,21 @@ else:
                     pdf_bytes = try_export_pdf(docx_bytes)
                     zf.writestr(f"{title}.pdf", pdf_bytes)
                 except Exception:
-                    # se não conseguir PDF, segue só com DOCX
                     pass
 
         zip_mem.seek(0)
         st.success("Pacote gerado!")
         st.download_button("⬇️ Baixar todos (.zip)", data=zip_mem, file_name="mous_gerados.zip", mime="application/zip")
 
-# ---------------------------
+# -------------------------------------------------
 # Dicas
-# ---------------------------
+# -------------------------------------------------
 with st.expander("Dicas para template .docx"):
     st.markdown(
         "- Use placeholders **`{{CHAVE}}`** (MAIÚSCULAS). Ex.: `{{GROUP_NAME}}`, `{{CNPJ}}`.\n"
         "- Evite quebrar `{{CHAVE}}` entre linhas/colunas.\n"
         "- Tabelas, cabeçalhos e rodapés são suportados.\n"
         "- **Calibri 11** é aplicado em todo o documento.\n"
-        "- **Negrito em tudo**, exceto: frase introdutória; linha do *Business Plan ... {{BP_DATE}}*; "
-        "título *2. Especificações e alterações acordadas:*; e o parágrafo de *{{COMMENTS}}* (PT/EN)."
+        "- **Negrito em tudo**, exceto: frase introdutória; linha do *Business Plan … {{BP_DATE}}*; "
+        "título *2. Especificações e alterações acordadas:*; linhas *N/A*; e o parágrafo de *{{COMMENTS}}* (PT/EN)."
     )
