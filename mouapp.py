@@ -13,9 +13,9 @@ from googleapiclient.http import MediaIoBaseDownload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
-# -------------------------------
+# --------------------------------
 # Config Streamlit
-# -------------------------------
+# --------------------------------
 st.set_page_config(page_title="Gerador de MOU – Jetour (OAuth)", page_icon="🚗", layout="wide")
 
 SCOPES = [
@@ -24,12 +24,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-# -------------------------------
-# OAuth do usuário (login local)
-# -------------------------------
+# --------------------------------
+# OAuth do usuário (lê de st.secrets OU de client_secret.json)
+# --------------------------------
 @st.cache_resource(show_spinner=False)
 def get_user_creds():
     creds = None
+
+    # tenta reaproveitar token salvo (apenas na execução atual)
     if os.path.exists("token.pickle"):
         with open("token.pickle", "rb") as f:
             creds = pickle.load(f)
@@ -38,14 +40,23 @@ def get_user_creds():
         if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
             creds.refresh(Request())
         else:
-            if not os.path.exists("client_secret.json"):
-                st.error("Arquivo client_secret.json não encontrado na mesma pasta do app.")
+            # 1) Streamlit Cloud: ler de st.secrets["client_secret"]
+            if "client_secret" in st.secrets:
+                client_config = json.loads(st.secrets["client_secret"])
+                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+                creds = flow.run_local_server(port=0)
+            # 2) Local: ler do arquivo client_secret.json
+            elif os.path.exists("client_secret.json"):
+                flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+                creds = flow.run_local_server(port=0)
+            else:
+                st.error("Credenciais OAuth não encontradas. Adicione `client_secret` em `Secrets` (Cloud) ou coloque `client_secret.json` na mesma pasta do app.")
                 st.stop()
-            flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
-            # abre o navegador para login com sua conta Google
-            creds = flow.run_local_server(port=0)
+
+        # salva token para reuso durante a sessão
         with open("token.pickle", "wb") as f:
             pickle.dump(creds, f)
+
     return creds
 
 @st.cache_resource(show_spinner=False)
@@ -55,9 +66,9 @@ def get_google_clients():
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     return docs, drive
 
-# -------------------------------
+# --------------------------------
 # Modelo de execução
-# -------------------------------
+# --------------------------------
 class DocRunConfig(BaseModel):
     template_doc_id: str
     output_folder_id: str
@@ -76,9 +87,9 @@ class DocRunConfig(BaseModel):
             fixed[key] = str(val)
         return fixed
 
-# -------------------------------
+# --------------------------------
 # Funções Drive/Docs
-# -------------------------------
+# --------------------------------
 def copy_template_to_folder(drive, template_id: str, new_title: str, folder_id: str) -> str:
     file_metadata = {"name": new_title, "parents": [folder_id]}
     copied = drive.files().copy(fileId=template_id, body=file_metadata).execute()
@@ -119,13 +130,13 @@ def export_docx(drive, document_id: str) -> bytes:
     fh.seek(0)
     return fh.read()
 
-# -------------------------------
+# --------------------------------
 # UI
-# -------------------------------
+# --------------------------------
 st.title("Gerador de MOU – Jetour (PT/EN) – OAuth")
 st.caption("Duplica um template do Google Docs, substitui placeholders e exporta como PDF/DOCX usando a sua conta (OAuth).")
 
-# Inicializa clientes (abre login na 1ª vez)
+# Inicializa clients (abre login na 1ª vez)
 try:
     docs, drive = get_google_clients()
 except Exception as e:
@@ -151,9 +162,9 @@ DEFAULT_KEYS = [
 
 batch_mode = st.toggle("📦 Modo em lote (CSV)", value=False)
 
-# -------------------------------
+# --------------------------------
 # Modo individual
-# -------------------------------
+# --------------------------------
 if not batch_mode:
     st.subheader("Gerar 1 documento")
     with st.form("single_form"):
@@ -201,9 +212,9 @@ if not batch_mode:
         except Exception as e:
             st.error(f"Erro ao gerar documento: {e}")
 
-# -------------------------------
+# --------------------------------
 # Modo CSV (lote)
-# -------------------------------
+# --------------------------------
 else:
     st.subheader("Gerar vários documentos via CSV")
     template_doc_id = st.text_input("ID do Google Docs TEMPLATE")
