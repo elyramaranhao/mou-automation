@@ -1,18 +1,22 @@
 import io
+import os
 import json
+import pickle
 import pandas as pd
 import streamlit as st
 from datetime import datetime
 from typing import Dict, List
 from pydantic import BaseModel, Field, validator
-from google.oauth2.service_account import Credentials
+
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
-# --------------------------------
+# -------------------------------
 # Config Streamlit
-# --------------------------------
-st.set_page_config(page_title="Gerador de MOU – Jetour", page_icon="🚗", layout="wide")
+# -------------------------------
+st.set_page_config(page_title="Gerador de MOU – Jetour (OAuth)", page_icon="🚗", layout="wide")
 
 SCOPES = [
     "https://www.googleapis.com/auth/documents",
@@ -20,9 +24,40 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-# --------------------------------
-# Classe de configuração
-# --------------------------------
+# -------------------------------
+# OAuth do usuário (login local)
+# -------------------------------
+@st.cache_resource(show_spinner=False)
+def get_user_creds():
+    creds = None
+    if os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as f:
+            creds = pickle.load(f)
+
+    if not creds or not getattr(creds, "valid", False):
+        if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+            creds.refresh(Request())
+        else:
+            if not os.path.exists("client_secret.json"):
+                st.error("Arquivo client_secret.json não encontrado na mesma pasta do app.")
+                st.stop()
+            flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+            # abre o navegador para login com sua conta Google
+            creds = flow.run_local_server(port=0)
+        with open("token.pickle", "wb") as f:
+            pickle.dump(creds, f)
+    return creds
+
+@st.cache_resource(show_spinner=False)
+def get_google_clients():
+    creds = get_user_creds()
+    docs = build("docs", "v1", credentials=creds, cache_discovery=False)
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return docs, drive
+
+# -------------------------------
+# Modelo de execução
+# -------------------------------
 class DocRunConfig(BaseModel):
     template_doc_id: str
     output_folder_id: str
@@ -41,16 +76,9 @@ class DocRunConfig(BaseModel):
             fixed[key] = str(val)
         return fixed
 
-# --------------------------------
-# Autenticação Google
-# --------------------------------
-@st.cache_resource
-def get_google_clients(sa_info: dict):
-    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    docs = build("docs", "v1", credentials=creds, cache_discovery=False)
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-    return docs, drive
-
+# -------------------------------
+# Funções Drive/Docs
+# -------------------------------
 def copy_template_to_folder(drive, template_id: str, new_title: str, folder_id: str) -> str:
     file_metadata = {"name": new_title, "parents": [folder_id]}
     copied = drive.files().copy(fileId=template_id, body=file_metadata).execute()
@@ -74,7 +102,7 @@ def export_pdf(drive, document_id: str) -> bytes:
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
-        status, done = downloader.next_chunk()
+        _, done = downloader.next_chunk()
     fh.seek(0)
     return fh.read()
 
@@ -87,39 +115,23 @@ def export_docx(drive, document_id: str) -> bytes:
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
-        status, done = downloader.next_chunk()
+        _, done = downloader.next_chunk()
     fh.seek(0)
     return fh.read()
 
-# --------------------------------
-# UI – Sidebar
-# --------------------------------
-with st.sidebar:
-    st.header("⚙️ Configuração")
-    sa_info = None
-    if "gcp_service_account" in st.secrets:
-        sa_info = json.loads(st.secrets["gcp_service_account"])
-        st.success("Credenciais carregadas do st.secrets")
-    else:
-        uploaded = st.file_uploader("Envie o JSON do Service Account", type=["json"])
-        if uploaded is not None:
-            sa_info = json.load(uploaded)
-            st.success("JSON carregado com sucesso")
+# -------------------------------
+# UI
+# -------------------------------
+st.title("Gerador de MOU – Jetour (PT/EN) – OAuth")
+st.caption("Duplica um template do Google Docs, substitui placeholders e exporta como PDF/DOCX usando a sua conta (OAuth).")
 
-    batch_mode = st.toggle("📦 Modo em lote (CSV)", value=False)
-
-st.title("Gerador de MOU – Jetour (PT/EN)")
-st.caption("Duplica um template, substitui placeholders e exporta como PDF/DOCX")
-
-if sa_info is None:
-    st.warning("Envie as credenciais na barra lateral para continuar.")
+# Inicializa clientes (abre login na 1ª vez)
+try:
+    docs, drive = get_google_clients()
+except Exception as e:
+    st.error(f"Falha na autenticação OAuth: {e}")
     st.stop()
 
-docs, drive = get_google_clients(sa_info)
-
-# --------------------------------
-# Placeholders padrão
-# --------------------------------
 DEFAULT_KEYS = [
     "FANTASY_NAME",
     "GROUP_NAME",
@@ -137,9 +149,11 @@ DEFAULT_KEYS = [
     "COMMENTS",
 ]
 
-# --------------------------------
+batch_mode = st.toggle("📦 Modo em lote (CSV)", value=False)
+
+# -------------------------------
 # Modo individual
-# --------------------------------
+# -------------------------------
 if not batch_mode:
     st.subheader("Gerar 1 documento")
     with st.form("single_form"):
@@ -148,7 +162,6 @@ if not batch_mode:
 
         st.divider()
         st.markdown("**Preencha os placeholders**")
-
         mapping: Dict[str, str] = {}
         cols = st.columns(3)
         for i, key in enumerate(DEFAULT_KEYS):
@@ -171,11 +184,9 @@ if not batch_mode:
                 placeholders=mapping,
             )
 
-            # Copiar template e substituir placeholders
             new_doc_id = copy_template_to_folder(drive, cfg.template_doc_id, cfg.document_title, cfg.output_folder_id)
             replace_all_text(docs, new_doc_id, cfg.placeholders)
 
-            # Exportar
             pdf_bytes = export_pdf(drive, new_doc_id)
             docx_bytes = export_docx(drive, new_doc_id)
 
@@ -183,16 +194,16 @@ if not batch_mode:
             doc_link = f"https://docs.google.com/document/d/{new_doc_id}/edit"
             st.markdown(f"📄 [Abrir no Google Docs]({doc_link})")
 
-            st.download_button("⬇️ Baixar PDF", pdf_bytes, file_name=f"{cfg.document_title}.pdf", mime="application/pdf")
             st.download_button("⬇️ Baixar DOCX", docx_bytes, file_name=f"{cfg.document_title}.docx",
                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            st.download_button("⬇️ Baixar PDF", pdf_bytes, file_name=f"{cfg.document_title}.pdf", mime="application/pdf")
 
         except Exception as e:
             st.error(f"Erro ao gerar documento: {e}")
 
-# --------------------------------
+# -------------------------------
 # Modo CSV (lote)
-# --------------------------------
+# -------------------------------
 else:
     st.subheader("Gerar vários documentos via CSV")
     template_doc_id = st.text_input("ID do Google Docs TEMPLATE")
@@ -204,6 +215,7 @@ else:
         results: List[Dict[str, str]] = []
         zip_buffer = io.BytesIO()
         import zipfile
+
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for _, row in df.iterrows():
                 placeholders = {k: str(row[k]) for k in df.columns if pd.notna(row[k])}
