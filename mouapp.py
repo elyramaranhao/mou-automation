@@ -7,6 +7,7 @@ from typing import Dict, List, Set
 import pandas as pd
 import streamlit as st
 from docx import Document
+from docx.shared import Pt
 from pydantic import BaseModel, Field, validator
 
 st.set_page_config(page_title="Gerador de MOU – (sem Google)", page_icon="📝", layout="wide")
@@ -17,16 +18,16 @@ PLACEHOLDER_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 # Utilitários .docx
 # ---------------------------
 def _iter_all_paragraphs(doc: Document):
-    # parágrafos “soltos”
+    # Parágrafos “soltos”
     for p in doc.paragraphs:
         yield p
-    # parágrafos em tabelas
+    # Parágrafos dentro de tabelas
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     yield p
-    # cabeçalho/rodapé
+    # Cabeçalho/Rodapé
     for section in doc.sections:
         if section.header:
             for p in section.header.paragraphs:
@@ -45,28 +46,34 @@ def extract_placeholders(doc: Document) -> Set[str]:
 
 def replace_placeholders(doc: Document, mapping: Dict[str, str]):
     """
-    Substitui placeholders em TODO o documento.
-    Observação: para preservar formatação, mantenha os placeholders sem
-    quebras e sem aplicar bold/itálico *dentro* das chaves no template.
+    Substitui placeholders no documento inteiro.
+    Depois, força fonte Calibri 11 em todos os runs.
     """
     normalized = {f"{{{{{k}}}}}": str(v) for k, v in mapping.items()}
 
     for p in _iter_all_paragraphs(doc):
-        # reconstrói o parágrafo como um único run para evitar placeholders cortados em runs
+        # Reconstrói o parágrafo como um único run para evitar placeholders cortados em runs
         full_text = "".join(run.text for run in p.runs) or p.text
-        if not full_text:
-            continue
+        if full_text is None:
+            full_text = ""
         replaced = full_text
         for k, v in normalized.items():
             replaced = replaced.replace(k, v)
 
         if replaced != full_text:
-            # limpa runs e escreve de novo (mantém estilo do parágrafo)
+            # Limpa runs antigos
             for _ in range(len(p.runs)):
-                p.runs[0].clear()  # limpa conteúdo do primeiro run
-                p.runs[0].text = ""  # evita bug de índice
-                p._element.remove(p.runs[0]._element)  # remove run
-            new_run = p.add_run(replaced)
+                p.runs[0].clear()
+                p.runs[0].text = ""
+                p._element.remove(p.runs[0]._element)
+            # Novo run com o texto substituído
+            p.add_run(replaced)
+
+    # 🔥 Força fonte/tamanho em TODO o documento
+    for p in _iter_all_paragraphs(doc):
+        for run in p.runs:
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
 
 class JobConfig(BaseModel):
     title: str
@@ -74,7 +81,7 @@ class JobConfig(BaseModel):
 
     @validator("placeholders")
     def upcase_keys(cls, v: Dict[str, str]):
-        # normaliza chaves: aceita com/sem {{}} e converte para UPPER_SNAKE
+        # Normaliza chaves: aceita com/sem {{}} e converte para UPPER_SNAKE
         fixed: Dict[str, str] = {}
         for k, val in v.items():
             kk = k.strip().strip("{} ").upper()
@@ -85,7 +92,7 @@ class JobConfig(BaseModel):
 # UI
 # ---------------------------
 st.title("Gerador de MOU – usando modelo .docx (sem Google)")
-st.caption("Faça upload do template .docx bi-coluna, preencha placeholders e baixe o .docx final. (CSV em lote opcional)")
+st.caption("Faça upload do template .docx bi-coluna, preencha placeholders e baixe o .docx final (fonte padronizada Calibri 11).")
 
 with st.sidebar:
     st.header("⚙️ Configuração")
@@ -127,7 +134,7 @@ if not batch_mode:
     if submitted:
         cfg = JobConfig(title=title.strip() or default_title, placeholders=mapping)
 
-        # duplica o template em memória e substitui
+        # Duplica o template em memória e substitui
         doc = Document(io.BytesIO(template_bytes))
         replace_placeholders(doc, cfg.placeholders)
 
@@ -159,7 +166,7 @@ else:
 
         zip_mem = io.BytesIO()
         with zipfile.ZipFile(zip_mem, "w", zipfile.ZIP_DEFLATED) as zf:
-            for idx, row in df.iterrows():
+            for _, row in df.iterrows():
                 mapping = {k: str(row.get(k, "")) for k in placeholders_found}
                 title = str(row.get("TITLE", f"MOU – {mapping.get('GROUP_NAME','Sem Nome')} – {datetime.now().strftime('%Y-%m-%d')}"))
 
@@ -182,8 +189,7 @@ with st.expander("Dicas para template .docx"):
     st.markdown(
         "- Use placeholders no formato **`{{CHAVE}}`** (MAIÚSCULAS, sem espaços). "
         "Ex.: `{{GROUP_NAME}}`, `{{CNPJ}}`, `{{FULL_ADDRESS}}`.\n"
-        "- Evite aplicar **negrito/itálico dentro** das chaves; aplique no texto fixo ao redor. "
-        "Isso ajuda a manter a formatação após a substituição.\n"
-        "- Não deixe `{{CHAVE}}` quebrar de linha ou ser cortado por formatação diferente no meio.\n"
-        "- Tabelas, cabeçalhos e rodapés são suportados."
+        "- Evite quebrar `{{CHAVE}}` entre linhas/colunas ou aplicar formatações dentro das chaves.\n"
+        "- Tabelas, cabeçalhos e rodapés são suportados.\n"
+        "- Todo o texto final é padronizado para **Calibri 11**."
     )
