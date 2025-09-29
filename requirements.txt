@@ -1,4 +1,5 @@
 streamlit
 python-docx
-pandas
 pydantic
+pandas
+docx2pdf
