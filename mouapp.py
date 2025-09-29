@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, validator
 
 st.set_page_config(page_title="Gerador de MOU – (sem Google)", page_icon="📝", layout="wide")
 
-PLACEHOLDER_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
+PLACEHOLDER_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}", re.IGNORECASE)
 
 # ---------------------------
 # Utilitários .docx
@@ -36,44 +36,76 @@ def _iter_all_paragraphs(doc: Document):
             for p in section.footer.paragraphs:
                 yield p
 
+def _para_text(p) -> str:
+    txt = "".join(run.text for run in p.runs) or p.text or ""
+    return txt
+
 def extract_placeholders(doc: Document) -> Set[str]:
     found: Set[str] = set()
     for p in _iter_all_paragraphs(doc):
-        text = "".join(run.text for run in p.runs) or p.text
+        text = _para_text(p)
         for m in PLACEHOLDER_RE.finditer(text):
-            found.add(m.group(1).strip())
+            found.add(m.group(1).strip().upper())
     return found
 
-def replace_placeholders(doc: Document, mapping: Dict[str, str]):
+def replace_placeholders_and_collect_exceptions(doc: Document, mapping: Dict[str, str]):
     """
     Substitui placeholders no documento inteiro.
-    Depois, força fonte Calibri 11 em todos os runs.
+    Coleta parágrafos-exceção (onde NÃO queremos negrito): os que contêm
+    {{BP_DATE}} e {{COMMENTS}} ANTES da substituição.
+    Retorna um set com objetos-parágrafo marcados como exceção.
     """
     normalized = {f"{{{{{k}}}}}": str(v) for k, v in mapping.items()}
+    exceptions = set()  # parágrafos que NÃO devem ficar em negrito
 
     for p in _iter_all_paragraphs(doc):
-        # Reconstrói o parágrafo como um único run para evitar placeholders cortados em runs
-        full_text = "".join(run.text for run in p.runs) or p.text
-        if full_text is None:
-            full_text = ""
-        replaced = full_text
-        for k, v in normalized.items():
-            replaced = replaced.replace(k, v)
+        orig_text = _para_text(p)
 
-        if replaced != full_text:
-            # Limpa runs antigos
+        # marca exceções por placeholder antes do replace
+        low = orig_text.lower()
+        if "{{bp_date}}" in low or "{{comments}}" in low:
+            exceptions.add(p)
+
+        # substituição simples no parágrafo “inteiro”
+        replaced = orig_text
+        for k, v in normalized.items():
+            # faz replace case-insensitive dos tokens {{CHAVE}}
+            pattern = re.compile(re.escape(k), re.IGNORECASE)
+            replaced = pattern.sub(v, replaced)
+
+        if replaced != orig_text:
+            # limpar runs e reescrever o parágrafo como 1 run
             for _ in range(len(p.runs)):
                 p.runs[0].clear()
                 p.runs[0].text = ""
                 p._element.remove(p.runs[0]._element)
-            # Novo run com o texto substituído
             p.add_run(replaced)
 
-    # 🔥 Força fonte/tamanho em TODO o documento
+    return exceptions
+
+def enforce_calibri11_and_bold_with_exceptions(doc: Document, exceptions: Set, extra_exceptions_phrases: List[re.Pattern]):
+    """
+    1) Define Calibri 11 para todo o documento.
+    2) Coloca tudo em negrito por padrão.
+    3) Remove negrito nos parágrafos marcados em 'exceptions' e
+       nos que casarem com as frases de exceção (PT/EN).
+    """
+    # Primeiro: padroniza Calibri 11 e bold=True em tudo
     for p in _iter_all_paragraphs(doc):
         for run in p.runs:
             run.font.name = "Calibri"
             run.font.size = Pt(11)
+            run.bold = True
+
+    # Depois: desmarca negrito apenas nos parágrafos de exceção
+    for p in _iter_all_paragraphs(doc):
+        text_norm = (_para_text(p) or "").strip()
+        text_low = re.sub(r"\s+", " ", text_norm).lower()
+
+        is_exception = (p in exceptions) or any(pat.search(text_low) for pat in extra_exceptions_phrases)
+        if is_exception:
+            for run in p.runs:
+                run.bold = False
 
 class JobConfig(BaseModel):
     title: str
@@ -89,10 +121,31 @@ class JobConfig(BaseModel):
         return fixed
 
 # ---------------------------
+# Frases de exceção (PT/EN)
+# ---------------------------
+# Usamos padrões "flexíveis" para não depender de pontuação exata.
+EXCEPTION_PHRASES = [
+    # 1) Frase longa de requisitos (PT)
+    re.compile(r"^como parte integrante deste documento.*requisitos.*continuidade do processo de nomea", re.IGNORECASE),
+    # 1) Frase longa (EN)
+    re.compile(r"^as an integral part of this document.*requirements.*continuity of the nomination process", re.IGNORECASE),
+
+    # 2) Linha do Business Plan (PT) – aceita com/sem data substituída
+    re.compile(r"^business plan apresentado e validado em", re.IGNORECASE),
+    # 2) Linha do Business Plan (EN)
+    re.compile(r"^business plan (presented|submitted).*(validated|approved).*on", re.IGNORECASE),
+
+    # 3) Título da seção 2 (PT)
+    re.compile(r"^2\.\s*especificaç(ões|oes) e altera(ções|coes) acordadas", re.IGNORECASE),
+    # 3) Título da seção 2 (EN)
+    re.compile(r"^2\.\s*specifications? and (agreed|approved) (changes|modifications)", re.IGNORECASE),
+]
+
+# ---------------------------
 # UI
 # ---------------------------
 st.title("Gerador de MOU – usando modelo .docx (sem Google)")
-st.caption("Faça upload do template .docx bi-coluna, preencha placeholders e baixe o .docx final (fonte padronizada Calibri 11).")
+st.caption("Faça upload do template .docx bi-coluna, preencha placeholders e baixe o .docx final (Calibri 11; negrito em tudo, com exceções).")
 
 with st.sidebar:
     st.header("⚙️ Configuração")
@@ -136,7 +189,8 @@ if not batch_mode:
 
         # Duplica o template em memória e substitui
         doc = Document(io.BytesIO(template_bytes))
-        replace_placeholders(doc, cfg.placeholders)
+        exceptions = replace_placeholders_and_collect_exceptions(doc, cfg.placeholders)
+        enforce_calibri11_and_bold_with_exceptions(doc, exceptions, EXCEPTION_PHRASES)
 
         out_buf = io.BytesIO()
         doc.save(out_buf)
@@ -171,7 +225,8 @@ else:
                 title = str(row.get("TITLE", f"MOU – {mapping.get('GROUP_NAME','Sem Nome')} – {datetime.now().strftime('%Y-%m-%d')}"))
 
                 doc = Document(io.BytesIO(template_bytes))
-                replace_placeholders(doc, mapping)
+                exceptions = replace_placeholders_and_collect_exceptions(doc, mapping)
+                enforce_calibri11_and_bold_with_exceptions(doc, exceptions, EXCEPTION_PHRASES)
 
                 buf = io.BytesIO()
                 doc.save(buf)
@@ -191,5 +246,6 @@ with st.expander("Dicas para template .docx"):
         "Ex.: `{{GROUP_NAME}}`, `{{CNPJ}}`, `{{FULL_ADDRESS}}`.\n"
         "- Evite quebrar `{{CHAVE}}` entre linhas/colunas ou aplicar formatações dentro das chaves.\n"
         "- Tabelas, cabeçalhos e rodapés são suportados.\n"
-        "- Todo o texto final é padronizado para **Calibri 11**."
+        "- Todo o texto final é padronizado para **Calibri 11**.\n"
+        "- Negrito é aplicado em tudo, **exceto** nas frases e campos definidos como exceção."
     )
