@@ -1,254 +1,189 @@
 import io
-import os
-import json
-import pickle
+import re
+import zipfile
+from datetime import datetime
+from typing import Dict, List, Set
+
 import pandas as pd
 import streamlit as st
-from datetime import datetime
-from typing import Dict, List
+from docx import Document
 from pydantic import BaseModel, Field, validator
 
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+st.set_page_config(page_title="Gerador de MOU – (sem Google)", page_icon="📝", layout="wide")
 
-# --------------------------------
-# Config Streamlit
-# --------------------------------
-st.set_page_config(page_title="Gerador de MOU – Jetour (OAuth)", page_icon="🚗", layout="wide")
+PLACEHOLDER_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 
-SCOPES = [
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/drive.file",
-]
+# ---------------------------
+# Utilitários .docx
+# ---------------------------
+def _iter_all_paragraphs(doc: Document):
+    # parágrafos “soltos”
+    for p in doc.paragraphs:
+        yield p
+    # parágrafos em tabelas
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    yield p
+    # cabeçalho/rodapé
+    for section in doc.sections:
+        if section.header:
+            for p in section.header.paragraphs:
+                yield p
+        if section.footer:
+            for p in section.footer.paragraphs:
+                yield p
 
-# --------------------------------
-# OAuth do usuário (lê de st.secrets OU de client_secret.json)
-# --------------------------------
-@st.cache_resource(show_spinner=False)
-def get_user_creds():
-    creds = None
+def extract_placeholders(doc: Document) -> Set[str]:
+    found: Set[str] = set()
+    for p in _iter_all_paragraphs(doc):
+        text = "".join(run.text for run in p.runs) or p.text
+        for m in PLACEHOLDER_RE.finditer(text):
+            found.add(m.group(1).strip())
+    return found
 
-    # tenta reaproveitar token salvo (apenas na execução atual)
-    if os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as f:
-            creds = pickle.load(f)
+def replace_placeholders(doc: Document, mapping: Dict[str, str]):
+    """
+    Substitui placeholders em TODO o documento.
+    Observação: para preservar formatação, mantenha os placeholders sem
+    quebras e sem aplicar bold/itálico *dentro* das chaves no template.
+    """
+    normalized = {f"{{{{{k}}}}}": str(v) for k, v in mapping.items()}
 
-    if not creds or not getattr(creds, "valid", False):
-        if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
-            creds.refresh(Request())
-        else:
-            # 1) Streamlit Cloud: ler de st.secrets["client_secret"]
-            if "client_secret" in st.secrets:
-                client_config = json.loads(st.secrets["client_secret"])
-                flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-                creds = flow.run_local_server(port=0)
-            # 2) Local: ler do arquivo client_secret.json
-            elif os.path.exists("client_secret.json"):
-                flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
-                creds = flow.run_local_server(port=0)
-            else:
-                st.error("Credenciais OAuth não encontradas. Adicione `client_secret` em `Secrets` (Cloud) ou coloque `client_secret.json` na mesma pasta do app.")
-                st.stop()
+    for p in _iter_all_paragraphs(doc):
+        # reconstrói o parágrafo como um único run para evitar placeholders cortados em runs
+        full_text = "".join(run.text for run in p.runs) or p.text
+        if not full_text:
+            continue
+        replaced = full_text
+        for k, v in normalized.items():
+            replaced = replaced.replace(k, v)
 
-        # salva token para reuso durante a sessão
-        with open("token.pickle", "wb") as f:
-            pickle.dump(creds, f)
+        if replaced != full_text:
+            # limpa runs e escreve de novo (mantém estilo do parágrafo)
+            for _ in range(len(p.runs)):
+                p.runs[0].clear()  # limpa conteúdo do primeiro run
+                p.runs[0].text = ""  # evita bug de índice
+                p._element.remove(p.runs[0]._element)  # remove run
+            new_run = p.add_run(replaced)
 
-    return creds
-
-@st.cache_resource(show_spinner=False)
-def get_google_clients():
-    creds = get_user_creds()
-    docs = build("docs", "v1", credentials=creds, cache_discovery=False)
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-    return docs, drive
-
-# --------------------------------
-# Modelo de execução
-# --------------------------------
-class DocRunConfig(BaseModel):
-    template_doc_id: str
-    output_folder_id: str
-    document_title: str
+class JobConfig(BaseModel):
+    title: str
     placeholders: Dict[str, str] = Field(default_factory=dict)
 
     @validator("placeholders")
-    def normalize_keys(cls, v: Dict[str, str]):
-        fixed = {}
+    def upcase_keys(cls, v: Dict[str, str]):
+        # normaliza chaves: aceita com/sem {{}} e converte para UPPER_SNAKE
+        fixed: Dict[str, str] = {}
         for k, val in v.items():
-            key = k.strip()
-            if not key.startswith("{{"):
-                key = "{{" + key
-            if not key.endswith("}}"):
-                key = key + "}}"
-            fixed[key] = str(val)
+            kk = k.strip().strip("{} ").upper()
+            fixed[kk] = str(val)
         return fixed
 
-# --------------------------------
-# Funções Drive/Docs
-# --------------------------------
-def copy_template_to_folder(drive, template_id: str, new_title: str, folder_id: str) -> str:
-    file_metadata = {"name": new_title, "parents": [folder_id]}
-    copied = drive.files().copy(fileId=template_id, body=file_metadata).execute()
-    return copied["id"]
-
-def replace_all_text(docs, document_id: str, mapping: Dict[str, str]):
-    requests = []
-    for key, value in mapping.items():
-        requests.append({
-            "replaceAllText": {
-                "containsText": {"text": key, "matchCase": True},
-                "replaceText": value,
-            }
-        })
-    if requests:
-        docs.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
-
-def export_pdf(drive, document_id: str) -> bytes:
-    request = drive.files().export(fileId=document_id, mimeType="application/pdf")
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.seek(0)
-    return fh.read()
-
-def export_docx(drive, document_id: str) -> bytes:
-    request = drive.files().export(
-        fileId=document_id,
-        mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.seek(0)
-    return fh.read()
-
-# --------------------------------
+# ---------------------------
 # UI
-# --------------------------------
-st.title("Gerador de MOU – Jetour (PT/EN) – OAuth")
-st.caption("Duplica um template do Google Docs, substitui placeholders e exporta como PDF/DOCX usando a sua conta (OAuth).")
+# ---------------------------
+st.title("Gerador de MOU – usando modelo .docx (sem Google)")
+st.caption("Faça upload do template .docx bi-coluna, preencha placeholders e baixe o .docx final. (CSV em lote opcional)")
 
-# Inicializa clients (abre login na 1ª vez)
-try:
-    docs, drive = get_google_clients()
-except Exception as e:
-    st.error(f"Falha na autenticação OAuth: {e}")
+with st.sidebar:
+    st.header("⚙️ Configuração")
+    batch_mode = st.toggle("📦 Modo em lote (CSV)", value=False)
+    st.markdown("**Modelo (.docx)**")
+    template_file = st.file_uploader("Envie o template .docx", type=["docx"])
+
+if template_file is None:
+    st.info("Envie o arquivo **.docx** do modelo para começar.")
     st.stop()
 
-DEFAULT_KEYS = [
-    "FANTASY_NAME",
-    "GROUP_NAME",
-    "CNPJ",
-    "CONTRACT_DATE",
-    "FULL_ADDRESS",
-    "SHOWROOM_SIZE",
-    "START_DATE",
-    "END_DATE",
-    "INSPECTION_DATE",
-    "OPENING_DATE",
-    "DEADLINE_DATE",
-    "BP_DATE",
-    "BP_FILE",
-    "COMMENTS",
-]
+# Carrega template em memória
+template_bytes = template_file.read()
+doc_template = Document(io.BytesIO(template_bytes))
+placeholders_found = sorted(list(extract_placeholders(doc_template)))
 
-batch_mode = st.toggle("📦 Modo em lote (CSV)", value=False)
+if not placeholders_found:
+    st.warning("Nenhum placeholder no formato {{CHAVE}} foi encontrado no modelo. Ex.: {{GROUP_NAME}}")
+    st.stop()
 
-# --------------------------------
+# ---------------------------
 # Modo individual
-# --------------------------------
+# ---------------------------
 if not batch_mode:
     st.subheader("Gerar 1 documento")
-    with st.form("single_form"):
-        template_doc_id = st.text_input("ID do Google Docs TEMPLATE")
-        output_folder_id = st.text_input("ID da pasta de destino (Drive)")
 
-        st.divider()
-        st.markdown("**Preencha os placeholders**")
-        mapping: Dict[str, str] = {}
+    with st.form("single"):
         cols = st.columns(3)
-        for i, key in enumerate(DEFAULT_KEYS):
+        mapping: Dict[str, str] = {}
+        for i, key in enumerate(placeholders_found):
             with cols[i % 3]:
                 mapping[key] = st.text_input(key, "")
 
-        document_title = st.text_input(
-            "Título do documento",
-            value=f"MOU – {mapping.get('GROUP_NAME','Sem Nome')} – {datetime.now().strftime('%Y-%m-%d')}"
-        )
+        default_title = f"MOU – {mapping.get('GROUP_NAME','Sem Nome')} – {datetime.now().strftime('%Y-%m-%d')}"
+        title = st.text_input("Título do documento (nome do arquivo)", value=default_title)
 
-        submitted = st.form_submit_button("Gerar documento", type="primary")
+        submitted = st.form_submit_button("Gerar .docx", type="primary")
 
     if submitted:
-        try:
-            cfg = DocRunConfig(
-                template_doc_id=template_doc_id.strip(),
-                output_folder_id=output_folder_id.strip(),
-                document_title=document_title.strip(),
-                placeholders=mapping,
-            )
+        cfg = JobConfig(title=title.strip() or default_title, placeholders=mapping)
 
-            new_doc_id = copy_template_to_folder(drive, cfg.template_doc_id, cfg.document_title, cfg.output_folder_id)
-            replace_all_text(docs, new_doc_id, cfg.placeholders)
+        # duplica o template em memória e substitui
+        doc = Document(io.BytesIO(template_bytes))
+        replace_placeholders(doc, cfg.placeholders)
 
-            pdf_bytes = export_pdf(drive, new_doc_id)
-            docx_bytes = export_docx(drive, new_doc_id)
+        out_buf = io.BytesIO()
+        doc.save(out_buf)
+        out_buf.seek(0)
 
-            st.success("Documento gerado!")
-            doc_link = f"https://docs.google.com/document/d/{new_doc_id}/edit"
-            st.markdown(f"📄 [Abrir no Google Docs]({doc_link})")
+        st.success("Documento gerado!")
+        st.download_button(
+            "⬇️ Baixar DOCX",
+            data=out_buf,
+            file_name=f"{cfg.title}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
 
-            st.download_button("⬇️ Baixar DOCX", docx_bytes, file_name=f"{cfg.document_title}.docx",
-                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            st.download_button("⬇️ Baixar PDF", pdf_bytes, file_name=f"{cfg.document_title}.pdf", mime="application/pdf")
-
-        except Exception as e:
-            st.error(f"Erro ao gerar documento: {e}")
-
-# --------------------------------
+# ---------------------------
 # Modo CSV (lote)
-# --------------------------------
+# ---------------------------
 else:
-    st.subheader("Gerar vários documentos via CSV")
-    template_doc_id = st.text_input("ID do Google Docs TEMPLATE")
-    output_folder_id = st.text_input("ID da pasta de destino (Drive)")
-    csv_file = st.file_uploader("CSV de dados", type=["csv"])
+    st.subheader("Gerar vários documentos (CSV)")
+    st.markdown("O CSV deve ter colunas com os **mesmos nomes** dos placeholders (sem `{{}}`). Ex.: `GROUP_NAME,CNPJ,...`. Opcional: `TITLE`.")
 
-    if csv_file is not None and st.button("Gerar documentos em lote", type="primary"):
-        df = pd.read_csv(csv_file)
-        results: List[Dict[str, str]] = []
-        zip_buffer = io.BytesIO()
-        import zipfile
+    csv_up = st.file_uploader("Envie o CSV", type=["csv"])
+    if csv_up is not None and st.button("Gerar ZIP com .docx", type="primary"):
+        df = pd.read_csv(csv_up)
+        missing_cols = [k for k in placeholders_found if k not in df.columns]
+        if missing_cols:
+            st.warning("Colunas ausentes no CSV: " + ", ".join(missing_cols))
 
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for _, row in df.iterrows():
-                placeholders = {k: str(row[k]) for k in df.columns if pd.notna(row[k])}
-                title = row.get("TITLE", f"MOU – {placeholders.get('GROUP_NAME','Sem Nome')} – {datetime.now().strftime('%Y-%m-%d')}")
-                cfg = DocRunConfig(
-                    template_doc_id=template_doc_id.strip(),
-                    output_folder_id=output_folder_id.strip(),
-                    document_title=str(title),
-                    placeholders=placeholders,
-                )
-                try:
-                    new_doc_id = copy_template_to_folder(drive, cfg.template_doc_id, cfg.document_title, cfg.output_folder_id)
-                    replace_all_text(docs, new_doc_id, cfg.placeholders)
-                    pdf_bytes = export_pdf(drive, new_doc_id)
-                    docx_bytes = export_docx(drive, new_doc_id)
-                    zf.writestr(f"{cfg.document_title}.pdf", pdf_bytes)
-                    zf.writestr(f"{cfg.document_title}.docx", docx_bytes)
-                    results.append({"title": cfg.document_title, "status": "OK"})
-                except Exception as e:
-                    results.append({"title": cfg.document_title, "status": f"ERRO: {e}"})
+        zip_mem = io.BytesIO()
+        with zipfile.ZipFile(zip_mem, "w", zipfile.ZIP_DEFLATED) as zf:
+            for idx, row in df.iterrows():
+                mapping = {k: str(row.get(k, "")) for k in placeholders_found}
+                title = str(row.get("TITLE", f"MOU – {mapping.get('GROUP_NAME','Sem Nome')} – {datetime.now().strftime('%Y-%m-%d')}"))
 
-        st.success("Processo concluído!")
-        st.dataframe(results)
-        zip_buffer.seek(0)
-        st.download_button("⬇️ Baixar todos (.zip)", data=zip_buffer, file_name="mous_gerados.zip", mime="application/zip")
+                doc = Document(io.BytesIO(template_bytes))
+                replace_placeholders(doc, mapping)
+
+                buf = io.BytesIO()
+                doc.save(buf)
+                buf.seek(0)
+                zf.writestr(f"{title}.docx", buf.read())
+
+        zip_mem.seek(0)
+        st.success("Pacote gerado!")
+        st.download_button("⬇️ Baixar todos (.zip)", data=zip_mem, file_name="mous_gerados.zip", mime="application/zip")
+
+# ---------------------------
+# Dicas
+# ---------------------------
+with st.expander("Dicas para template .docx"):
+    st.markdown(
+        "- Use placeholders no formato **`{{CHAVE}}`** (MAIÚSCULAS, sem espaços). "
+        "Ex.: `{{GROUP_NAME}}`, `{{CNPJ}}`, `{{FULL_ADDRESS}}`.\n"
+        "- Evite aplicar **negrito/itálico dentro** das chaves; aplique no texto fixo ao redor. "
+        "Isso ajuda a manter a formatação após a substituição.\n"
+        "- Não deixe `{{CHAVE}}` quebrar de linha ou ser cortado por formatação diferente no meio.\n"
+        "- Tabelas, cabeçalhos e rodapés são suportados."
+    )
