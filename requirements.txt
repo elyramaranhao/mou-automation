@@ -3,3 +3,4 @@ python-docx
 pydantic
 pandas
 docx2pdf
+openpyxl
